@@ -565,9 +565,20 @@ func TestEstimateStoreTxBytes(t *testing.T) {
 		PathJSON:    `["aa","bb"]`,
 	}
 	est := estimateStoreTxBytes(tx)
-	// Manual calculation: base + string lengths + index entries + perTxMaps + path hops + subpaths
+	// Manual calculation. Since the 2026-08-08 store-accounting audit each string field is charged at its
+	// ALLOCATOR SIZE CLASS rather than its raw length — the runtime never hands
+	// back exactly len(s) bytes, and for short fields that rounding is most of
+	// the cost.
 	hops := int64(len(txGetParsedPath(tx)))
-	manualCalc := int64(storeTxBaseBytes) + int64(len(tx.RawHex)+len(tx.Hash)+len(tx.DecodedJSON)+len(tx.PathJSON)) + int64(numIndexesPerTx*indexEntryBytes)
+	manualCalc := int64(storeTxBaseBytes)
+	manualCalc += goSizeClass(int64(len(tx.RawHex)))
+	manualCalc += goSizeClass(int64(len(tx.Hash)))
+	manualCalc += goSizeClass(int64(len(tx.DecodedJSON)))
+	manualCalc += goSizeClass(int64(len(tx.PathJSON)))
+	manualCalc += goSizeClass(int64(len(tx.FirstSeen)))
+	manualCalc += goSizeClass(int64(len(tx.ScopeName)))
+	manualCalc += goSizeClass(int64(len(tx.LatestSeen)))
+	manualCalc += int64(numIndexesPerTx * indexEntryBytes)
 	manualCalc += perTxMapsBytes
 	manualCalc += hops * perPathHopBytes
 	if hops > 1 {
@@ -587,10 +598,30 @@ func TestEstimateStoreObsBytes(t *testing.T) {
 		PathJSON:   `["aa"]`,
 	}
 	est := estimateStoreObsBytes(obs)
-	// storeObsBaseBytes(192) + len(ObserverID=6) + len(PathJSON=6) + 2*48(96) = 300
-	expected := int64(192 + 6 + 6 + 2*48)
+	// Since the 2026-08-08 store-accounting audit: struct size class + every string field at ITS size class +
+	// one allocation per non-nil optional scalar + index entries + the
+	// tx.obsKeys / tx.observerSet entries this observation adds.
+	//   storeObsBaseBytes                              208
+	//   ObserverID   "obs123" (6)  -> goSizeClass(6)     8
+	//   PathJSON     `["aa"]` (6)  -> goSizeClass(6)     8
+	//   Name/IATA/Direction/Timestamp/RawHex empty       0
+	//   SNR/RSSI/Score all nil                           0
+	//   numIndexesPerObs * indexEntryBytes              96
+	//   obsKeys key "obs123|[\"aa\"]" (13) -> 16, +40   56
+	//   observerSet entry                               40
+	//                                                  ---
+	//                                                  416
+	expected := int64(storeObsBaseBytes) +
+		goSizeClass(int64(len(obs.ObserverID))) +
+		goSizeClass(int64(len(obs.PathJSON))) +
+		int64(numIndexesPerObs*indexEntryBytes) +
+		goSizeClass(int64(len(obs.ObserverID)+1+len(obs.PathJSON))) + mapEntryOverheadBytes +
+		mapEntryOverheadBytes
 	if est != expected {
 		t.Fatalf("estimateStoreObsBytes = %d, want %d", est, expected)
+	}
+	if est != 416 {
+		t.Fatalf("estimateStoreObsBytes = %d, want 416 (see breakdown above)", est)
 	}
 }
 

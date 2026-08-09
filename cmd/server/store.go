@@ -4406,14 +4406,21 @@ func (s *PacketStore) buildDistanceIndex() {
 // - byPathHop index entries (20-40MB at scale)
 // Note: ResolvedPath per-obs overhead eliminated by #800 refactor.
 const (
-	storeTxBaseBytes  = 384 // StoreTx struct fields + map headers + sync.Once + string headers
-	storeObsBaseBytes = 192 // StoreObs struct fields + string headers
+	// Struct size classes. These are the allocator class for the struct itself
+	// (string HEADERS included, string DATA charged separately per field).
+	// TestStoreStructSizesMatchConstants fails if the structs change and these
+	// are not updated.
+	storeTxBaseBytes  = 320 // goSizeClass(unsafe.Sizeof(StoreTx{}))  == 320
+	storeObsBaseBytes = 208 // goSizeClass(unsafe.Sizeof(StoreObs{})) == 200 -> 208
 	strHdr            = 16  // Go string header (ptr + len) on a 64-bit build; used by GetStoreMemoryBreakdown
 	indexEntryBytes   = 48  // average cost of one index map entry (key + pointer + bucket overhead)
 	numIndexesPerTx   = 5   // byHash, byTxID, byNode, byPayloadType, nodeHashes entries
 	numIndexesPerObs  = 2   // byObsID, byObserver entries
 
-	// Per-tx map overhead (obsKeys + observerSet): map header + initial buckets
+	// Per-tx map overhead (obsKeys + observerSet): the two map HEADERS and their
+	// initial buckets only. The per-entry cost is charged per observation in
+	// estimateStoreObsBytes (obsDedupEntryBytes) because both maps gain one
+	// entry per observation, not one per transmission.
 	perTxMapsBytes = 200
 
 	// Per path hop: byPathHop index entry (pointer + map bucket)
@@ -4421,13 +4428,55 @@ const (
 
 	// Per subpath entry in spTxIndex: string key + slice append + pointer
 	perSubpathEntryBytes = 40
+
+	// mapEntryOverheadBytes is the per-entry cost of a Go map beyond the key
+	// payload itself: the key header stored in the bucket, the value slot, the
+	// tophash byte, and the amortized share of bucket/overflow allocation at a
+	// typical load factor.
+	mapEntryOverheadBytes = 40
 )
+
+// goSizeClass rounds an allocation request up to Go's actual allocator size
+// class. The runtime never hands out exactly len(s) bytes for a string — it
+// rounds to one of a fixed ladder of classes, and for the short strings that
+// dominate an observation (a 3-byte IATA code, a 2-byte direction) the rounding
+// IS most of the cost. Ignoring it is a large part of why the estimator ran
+// ~0.6x of real heap.
+//
+// Classes below are Go's small-object ladder; anything larger is served by
+// whole pages, so round to 8KiB.
+func goSizeClass(n int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	classes := [...]int64{
+		8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192,
+		208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512,
+		576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792,
+		2048, 2304, 2688, 3072, 3200, 3456, 4096, 4864, 5376, 6144,
+		6528, 6784, 6912, 8192,
+	}
+	for _, c := range classes {
+		if n <= c {
+			return c
+		}
+	}
+	// Large objects are page-allocated; round up to 8KiB pages.
+	const page = 8192
+	return ((n + page - 1) / page) * page
+}
 
 // estimateStoreTxBytes returns the estimated memory cost of a StoreTx (excluding observations).
 // Includes per-tx maps (obsKeys, observerSet), byPathHop entries, and spTxIndex subpath entries.
 func estimateStoreTxBytes(tx *StoreTx) int64 {
 	base := int64(storeTxBaseBytes)
-	base += int64(len(tx.RawHex) + len(tx.Hash) + len(tx.DecodedJSON) + len(tx.PathJSON))
+	base += goSizeClass(int64(len(tx.RawHex)))
+	base += goSizeClass(int64(len(tx.Hash)))
+	base += goSizeClass(int64(len(tx.DecodedJSON)))
+	base += goSizeClass(int64(len(tx.PathJSON)))
+	base += goSizeClass(int64(len(tx.FirstSeen)))
+	base += goSizeClass(int64(len(tx.ScopeName)))
+	base += goSizeClass(int64(len(tx.LatestSeen)))
 	base += int64(numIndexesPerTx * indexEntryBytes)
 
 	// Per-tx maps: obsKeys + observerSet
@@ -4450,27 +4499,86 @@ func estimateStoreTxBytes(tx *StoreTx) int64 {
 // transmission with the given number of observations. Used for budget
 // calculation during bounded cold load (no actual StoreTx needed).
 func estimateStoreTxBytesTypical(numObs int) int64 {
-	// Typical tx: ~64 byte hash, ~200 byte decoded JSON, ~40 byte path, 3 hops
-	base := int64(storeTxBaseBytes) + 64 + 200 + 40
+	// Mirrors estimateStoreTxBytes / estimateStoreObsBytes term for term so the
+	// cold-load budget cannot drift away from the accounting the running store
+	// uses. Field sizes are the medians measured on the grav deployment
+	// 2026-08-08 (50k newest transmissions, 200k newest observations).
+	// TestTypicalEstimateAgreesWithRealEstimate pins the two together.
+	const (
+		typRawHex     = 159
+		typHash       = 16
+		typDecoded    = 268
+		typFirstSeen  = 20
+		typPathJSON   = 44
+		typObserverID = 64
+		typObsName    = 14
+		typObsIATA    = 3
+		typDirection  = 2
+		typTimestamp  = 24
+		typHops       = 3
+	)
+
+	base := int64(storeTxBaseBytes)
+	base += goSizeClass(typRawHex) + goSizeClass(typHash) + goSizeClass(typDecoded)
+	base += goSizeClass(typPathJSON) + goSizeClass(typFirstSeen)
 	base += int64(numIndexesPerTx * indexEntryBytes)
 	base += perTxMapsBytes
-	hops := int64(3)
-	base += hops * perPathHopBytes
-	base += (hops * (hops - 1) / 2) * perSubpathEntryBytes
-	// Add observation costs
-	obsBase := int64(storeObsBaseBytes) + 30 + 30 + 60 // observer ID + name + path
+	base += typHops * perPathHopBytes
+	base += (typHops * (typHops - 1) / 2) * perSubpathEntryBytes
+
+	obsBase := int64(storeObsBaseBytes)
+	obsBase += goSizeClass(typObserverID) + goSizeClass(typObsName) + goSizeClass(typObsIATA)
+	obsBase += goSizeClass(typDirection) + goSizeClass(typPathJSON) + goSizeClass(typTimestamp)
+	obsBase += goSizeClass(8) * 2 // SNR and RSSI are non-NULL on ~100% of prod rows
 	obsBase += int64(numIndexesPerObs * indexEntryBytes)
+	// tx.obsKeys + tx.observerSet entries — one pair per observation.
+	obsBase += goSizeClass(typObserverID+1+typPathJSON) + mapEntryOverheadBytes
+	obsBase += mapEntryOverheadBytes
 	// No per-obs ResolvedPath overhead (#800)
-	base += int64(numObs) * obsBase
-	return base
+
+	return base + int64(numObs)*obsBase
 }
 
 // estimateStoreObsBytes returns the estimated memory cost of a StoreObs.
 // ResolvedPath membership index overhead is tracked separately.
 func estimateStoreObsBytes(obs *StoreObs) int64 {
 	base := int64(storeObsBaseBytes)
-	base += int64(len(obs.PathJSON) + len(obs.ObserverID))
+
+	// Every string field is its own heap allocation, rounded to a size class.
+	// The v3 schema stores only observations.observer_idx — ObserverID/Name/IATA
+	// are re-inflated per row by the load-time JOIN against the 30-row observers
+	// table, so each observation really does own a private copy of all three.
+	// (Collapsing that duplication is Stage 3, not this change.)
+	base += goSizeClass(int64(len(obs.ObserverID)))
+	base += goSizeClass(int64(len(obs.ObserverName)))
+	base += goSizeClass(int64(len(obs.ObserverIATA)))
+	base += goSizeClass(int64(len(obs.Direction)))
+	base += goSizeClass(int64(len(obs.PathJSON)))
+	base += goSizeClass(int64(len(obs.Timestamp)))
+	base += goSizeClass(int64(len(obs.RawHex)))
+
+	// Optional scalars are pointers; each non-nil one is its own allocation.
+	if obs.SNR != nil {
+		base += goSizeClass(8)
+	}
+	if obs.RSSI != nil {
+		base += goSizeClass(8)
+	}
+	if obs.Score != nil {
+		base += goSizeClass(8)
+	}
+
+	// byObsID + byObserver entries.
 	base += int64(numIndexesPerObs * indexEntryBytes)
+
+	// tx.obsKeys gains one entry per observation, keyed by a freshly allocated
+	// observerID+"|"+pathJSON string that lives as long as the transmission
+	// does; tx.observerSet gains one more. Both were previously folded into a
+	// flat 200-byte-per-TRANSMISSION constant, which under-counted them by ~30x
+	// on prod (25 observations/tx, 109-byte keys).
+	base += goSizeClass(int64(len(obs.ObserverID)+1+len(obs.PathJSON))) + mapEntryOverheadBytes
+	base += mapEntryOverheadBytes
+
 	// ResolvedPath field removed (#800) — no per-obs RP overhead
 	return base
 }
@@ -4498,50 +4606,108 @@ func (s *PacketStore) trackedMemoryMB() float64 {
 // evictionCandidateTxIDs determines which tx IDs would be evicted and returns them.
 // Must be called under s.mu.Lock (or RLock). Does NOT modify any state.
 func (s *PacketStore) evictionCandidateTxIDs() []int {
+	victims := s.selectEvictionSet()
+	if len(victims) == 0 {
+		return nil
+	}
+	ids := make([]int, len(victims))
+	for i, tx := range victims {
+		ids[i] = tx.ID
+	}
+	return ids
+}
+
+// txActivityTime returns the timestamp retention judges a transmission by: the
+// most recent observation, falling back to FirstSeen when there is none (or
+// when clock skew puts an observation before it).
+//
+// Retention means "active within N hours", not "first seen within N hours"
+// first_seen is written once and never updated, so judging by it
+// evicts long-lived hashes that are still carrying live traffic — the exact
+// transmissions #1690 changed the cold-load query to include. Judging by
+// activity makes eviction agree with the loader instead of fighting it; before
+// this, prod loaded 151,785 observations and dropped them on the next tick.
+func txActivityTime(tx *StoreTx) string {
+	if tx.LatestSeen > tx.FirstSeen {
+		return tx.LatestSeen
+	}
+	return tx.FirstSeen
+}
+
+// selectEvictionSet returns the transmissions eviction should remove. Must be
+// called under s.mu. Does NOT modify any state.
+//
+// The two triggers deliberately use different axes:
+//
+//   - RETENTION evicts by activity (txActivityTime), so the result is NOT
+//     necessarily a contiguous prefix of s.packets — a stale transmission can
+//     sit between two live ones.
+//   - MEMORY PRESSURE evicts oldest-inserted first, walking s.packets in order,
+//     because under pressure the only goal is to free bytes quickly.
+//
+// s.packets is ordered oldest-first by FirstSeen, and txActivityTime(tx) is
+// always >= tx.FirstSeen, so retention only has to inspect the head run whose
+// FirstSeen predates the cutoff. Anything newer than that cannot be stale, which
+// keeps this O(stale prefix) rather than O(store).
+func (s *PacketStore) selectEvictionSet() []*StoreTx {
 	if s.retentionHours <= 0 && s.maxMemoryMB <= 0 {
 		return nil
 	}
-	cutoffIdx := 0
+
+	var victims []*StoreTx
+	chosen := make(map[int]struct{})
+
 	if s.retentionHours > 0 {
 		cutoff := time.Now().UTC().Add(-time.Duration(s.retentionHours * float64(time.Hour))).Format(time.RFC3339)
-		for cutoffIdx < len(s.packets) && s.packets[cutoffIdx].FirstSeen < cutoff {
-			cutoffIdx++
+		for _, tx := range s.packets {
+			if tx.FirstSeen >= cutoff {
+				break // ordered by FirstSeen; nothing after this can be stale
+			}
+			if txActivityTime(tx) < cutoff {
+				victims = append(victims, tx)
+				chosen[tx.ID] = struct{}{}
+			}
 		}
 	}
-	if s.maxMemoryMB > 0 {
+
+	if s.maxMemoryMB > 0 && len(s.packets) > 0 {
 		highWatermark := int64(s.maxMemoryMB) * 1048576
 		lowWatermark := int64(float64(highWatermark) * 0.85)
-		if s.trackedBytes > highWatermark && len(s.packets) > 0 {
-			var bytesToEvict int64
-			memCutoff := cutoffIdx
-			for memCutoff < len(s.packets) && (s.trackedBytes-bytesToEvict) > lowWatermark {
-				tx := s.packets[memCutoff]
-				bytesToEvict += estimateStoreTxBytes(tx)
+		if s.trackedBytes > highWatermark {
+			txBytes := func(tx *StoreTx) int64 {
+				n := estimateStoreTxBytes(tx)
 				for _, obs := range tx.Observations {
-					bytesToEvict += estimateStoreObsBytes(obs)
+					n += estimateStoreObsBytes(obs)
 				}
-				memCutoff++
+				return n
 			}
+			var bytesToEvict int64
+			for _, tx := range victims {
+				bytesToEvict += txBytes(tx)
+			}
+			// Safety cap: never evict more than 25% of packets in a single
+			// pass. This bounds the memory-pressure additions only — a
+			// retention set larger than the cap is never trimmed, matching the
+			// pre-audit behaviour.
 			maxEvict := len(s.packets) / 4
 			if maxEvict < 1 {
 				maxEvict = 1
 			}
-			if memCutoff > maxEvict {
-				memCutoff = maxEvict
-			}
-			if memCutoff > cutoffIdx {
-				cutoffIdx = memCutoff
+			for _, tx := range s.packets {
+				if len(victims) >= maxEvict || (s.trackedBytes-bytesToEvict) <= lowWatermark {
+					break
+				}
+				if _, done := chosen[tx.ID]; done {
+					continue
+				}
+				bytesToEvict += txBytes(tx)
+				victims = append(victims, tx)
+				chosen[tx.ID] = struct{}{}
 			}
 		}
 	}
-	if cutoffIdx == 0 || cutoffIdx > len(s.packets) {
-		return nil
-	}
-	ids := make([]int, cutoffIdx)
-	for i := 0; i < cutoffIdx; i++ {
-		ids[i] = s.packets[i].ID
-	}
-	return ids
+
+	return victims
 }
 
 // EvictStaleWithRP runs eviction using pre-fetched resolved pubkeys.
@@ -4563,56 +4729,15 @@ func (s *PacketStore) evictStaleInternal(rpBatch map[int][]string) int {
 		return 0
 	}
 
-	cutoffIdx := 0
-
-	// Time-based eviction: find how many packets from the head are too old
-	if s.retentionHours > 0 {
-		cutoff := time.Now().UTC().Add(-time.Duration(s.retentionHours * float64(time.Hour))).Format(time.RFC3339)
-		for cutoffIdx < len(s.packets) && s.packets[cutoffIdx].FirstSeen < cutoff {
-			cutoffIdx++
-		}
-	}
-
-	// Memory-based eviction: use self-accounted trackedBytes with watermark hysteresis.
-	// High watermark = maxMemoryMB (trigger), low watermark = 85% (stop).
-	// Safety cap: never evict more than 25% of packets in a single pass.
-	if s.maxMemoryMB > 0 {
-		highWatermark := int64(s.maxMemoryMB) * 1048576
-		lowWatermark := int64(float64(highWatermark) * 0.85)
-		if s.trackedBytes > highWatermark && len(s.packets) > 0 {
-			// Evict from head until trackedBytes would drop below low watermark
-			var bytesToEvict int64
-			memCutoff := cutoffIdx
-			for memCutoff < len(s.packets) && (s.trackedBytes-bytesToEvict) > lowWatermark {
-				tx := s.packets[memCutoff]
-				bytesToEvict += estimateStoreTxBytes(tx)
-				for _, obs := range tx.Observations {
-					bytesToEvict += estimateStoreObsBytes(obs)
-				}
-				memCutoff++
-			}
-			// Safety cap: never evict more than 25% in a single pass
-			maxEvict := len(s.packets) / 4
-			if maxEvict < 1 {
-				maxEvict = 1
-			}
-			if memCutoff > maxEvict {
-				memCutoff = maxEvict
-			}
-			if memCutoff > cutoffIdx {
-				cutoffIdx = memCutoff
-			}
-		}
-	}
-
-	if cutoffIdx == 0 {
+	// Selection lives in selectEvictionSet so evictionCandidateTxIDs (the
+	// lock-free planning pass in RunEviction) and this function can never
+	// disagree about what is about to be removed. Retention judges by ACTIVITY,
+	// so this is not necessarily a prefix of s.packets.
+	evicting := s.selectEvictionSet()
+	if len(evicting) == 0 {
 		return 0
 	}
-	if cutoffIdx > len(s.packets) {
-		cutoffIdx = len(s.packets)
-	}
-
-	evicting := s.packets[:cutoffIdx]
+	cutoffIdx := len(evicting)
 	evictedObs := 0
 	var evictedBytes int64
 
@@ -4766,9 +4891,22 @@ func (s *PacketStore) evictStaleInternal(rpBatch map[int][]string) int {
 	}
 	s.distPaths = newDistPaths
 
-	// Trim packets slice
-	n := copy(s.packets, s.packets[cutoffIdx:])
-	s.packets = s.packets[:n]
+	// Compact the packets slice. The evicted set is not necessarily a head
+	// prefix any more, so filter by ID rather than trimming. The tail beyond the
+	// new length is nil'd: leaving stale *StoreTx in the backing array keeps
+	// every evicted transmission (and its whole observation list) reachable, so
+	// the GC cannot reclaim any of it until an equal number of new packets
+	// happen to overwrite those slots.
+	kept := s.packets[:0]
+	for _, tx := range s.packets {
+		if _, gone := evictedTxIDs[tx.ID]; !gone {
+			kept = append(kept, tx)
+		}
+	}
+	for i := len(kept); i < len(s.packets); i++ {
+		s.packets[i] = nil
+	}
+	s.packets = kept
 	s.totalObs -= evictedObs
 
 	evictCount := cutoffIdx
