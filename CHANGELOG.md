@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+## [3.10.0] — 2026-08-10
+
+66 commits since v3.9.2. See [docs/release-notes/v3.10.0.md](docs/release-notes/v3.10.0.md) for the full notes.
+
+### ⚠️ Operator action required
+- **Check `config.json` for a `packetStore` block.** Without one the in-memory store is **unbounded** — `retentionHours` and `maxMemoryMB` both default to `0` (unlimited) and the eviction ticker is a no-op when both are zero. A production instance was restarting ~104×/day from exactly this; adding `{"retentionHours": 72, "maxMemoryMB": 900}` took it from 4,809 MB RSS to ~1,920 MB and zero restarts.
+- **`maxMemoryMB` semantics corrected.** Self-accounting was 0.62× of real heap, so the cap under-delivered by ~1.6×. Now 1.01×. Stores will hold **less** than before at the same setting — raise it ~1.6× to keep the same working set.
+- **`retentionHours` now means "active within", not "first seen within".** You retain ~25% more at the same setting.
+
+### 📉 Memory
+- **Drop redundant per-observation `raw_hex`** (#1773) — ~98 MB of duplication and ~1.7M allocations on a live store; reader already fell back to `tx.RawHex` (#881). Production: 1,920 MB → ~1,310–1,740 MB, unchanged dataset and config.
+- **Honest store accounting** — allocator size classes modelled; the per-observation dedup-map cost (`tx.obsKeys` + `tx.observerSet`) is charged per observation instead of a flat 200 B/transmission.
+- **Retention aligned to the loader's axis** — eviction judges by most-recent activity. Removes 24% of wasted cold-start work (813,545 observations loaded, 194,829 evicted within 30s on prod).
+- **Eviction no longer pins evicted transmissions** — the packets slice tail is nil'd; stale pointers past the new length kept evicted transmissions and their observation lists reachable.
+- **`/api/perf?mem=1`** (#1773) — opt-in per-component store breakdown.
+
+### 🔒 Security
+- **`/ws` WebSocket origin allowlist** (#1793) — the upgrader previously accepted every origin, letting any site stream your live packet feed. Same-origin and empty-`Origin` allowed; otherwise must be in `corsAllowedOrigins`. `"*"` deliberately ignored for `/ws`. **Reverse proxies must preserve the `Host` header.**
+
+### ✨ Features
+- Opt-in mobile client-RX coverage + `/api/nodes/resolve` (#1728) · "My Repeaters" dashboard (#1761) · 4-axis repeater usefulness score (#1762) · transported region scopes (#1751) · "Multibyte only" live filter (#1780) · `flood_advert_count_7d` (#1831) · `unscoped_relay_count_24h` (#1823) · `routed_through` filter and dest/src-hash autocomplete (#1774, #1800).
+
+### 🔍 Decoder
+- CONTROL `DISCOVER_REQ`/`RESP` (#1802) · GRP_DATA channel hash + inner fields (#1792) · Group Data / Multipart / Control / Raw Custom in the type filter (#1791, #1798) · firmware-default Public channel `0x11` preserved (#1729) · preamble-aware LoRa time-on-air for Relay Airtime Share (#1768) · TRACE Hop Bytes column (#1849).
+
+### 📡 Reliability
+- MQTT watchdog escalation + emit-panic recovery + exposed tick (#1749, #1810) · background loader gated on `LoadChunked` completion (#1809) · reference ingest-freshness watchdog shipped in `deploy/`.
+
+### 🎨 Accessibility
+- axe CI gate expanded to all 14 analytics tabs plus the prefix tool; WCAG AA contrast fixes for subpath hop prefixes, clock-skew badges, role swatches and dark-theme tokens (#1705, #1706, #1715, #1719, #1720).
+
 ## [3.9.1] — 2026-06-12
 
 Patch release on top of v3.9.0 — v3.9.0's container image never published (Playwright flake gated Docker build). See [docs/release-notes/v3.9.1.md](docs/release-notes/v3.9.1.md).
