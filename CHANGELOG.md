@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### ✨ Features
+- **Browser-added channels appear in the packets channel filter.** Channels added locally (keys held in the browser, never sent to the server) were missing from the Packets page channel dropdown because the server files their traffic under `enc_<HH>` and `/api/channels` omits it. The picker now derives that same hash client-side and lists those channels under a "My Channels (this browser)" group. Frontend-only — `/api/packets?channel=enc_<HH>` already worked.
+
 ## [3.10.0] — 2026-08-10
 
 66 commits since v3.9.2. See [docs/release-notes/v3.10.0.md](docs/release-notes/v3.10.0.md) for the full notes.
