@@ -1754,7 +1754,25 @@ window.addEventListener('DOMContentLoaded', () => {
   // --- Nav Stats ---
   async function updateNavStats() {
     try {
-      const stats = await api('/stats', { ttl: CLIENT_TTL.stats });
+      // UX analytics: self-label the nav-stats poll with the current SPA
+      // route. CoreScope is hash-routed, so `#/live` never reaches the
+      // server (browsers strip the fragment from both the request line and
+      // Referer). Without this param, view popularity can only be *inferred*
+      // from which /api/* endpoints fired, which is ambiguous — e.g.
+      // /api/analytics/neighbor-graph is called by BOTH live.js and
+      // analytics.js and is only separable by query string. nginx pulls this
+      // straight out with $arg_v into the corescope_ux JSON access log.
+      //
+      // Only the normalised page name is sent (`currentPage`, i.e. navigate()'s
+      // basePage) — never a routeParam, so no pubkey, packet hash or observer
+      // ID leaks into the access log and the metric tag stays low-cardinality.
+      // 'boot' covers the one call that runs before the first navigate().
+      //
+      // Safe on both ends: handleStats ignores unknown query params, and
+      // api()'s cache key is the full path, so each view keeps its own 10s
+      // TTL entry (~20 max) while invalidateApiCache('/stats') — a prefix
+      // match — still clears all of them.
+      const stats = await api('/stats?v=' + encodeURIComponent(currentPage || 'boot'), { ttl: CLIENT_TTL.stats });
       const el = document.getElementById('navStats');
       if (el) {
         el.innerHTML = `<span class="stat-val">${stats.totalPackets}</span> pkts · <span class="stat-val">${stats.totalNodes}</span> nodes · <span class="stat-val">${stats.totalObservers}</span> obs`;
