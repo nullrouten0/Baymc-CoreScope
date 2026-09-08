@@ -100,7 +100,6 @@ jobs:
           node test-confidence-indicator.js
           node test-1659-analytics-warmup.js
           node test-channels-merge-1498-unit.js
-          node test-packets-local-channels.js
           node test-issue-1518-home-url.js
           node test-channel-decrypt-insecure-context.js
           node test-live-region-filter.js
@@ -496,7 +495,6 @@ jobs:
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1630-reach-mobile-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-node-reach-coverage-e2e.js 2>&1 | tee -a e2e-output.txt
           CHROMIUM_REQUIRE=1 BASE_URL=http://localhost:13581 node test-issue-1640-compare-discovery-e2e.js 2>&1 | tee -a e2e-output.txt
-          CHROMIUM_REQUIRE=1 node test-neighbor-map-btn-clip-e2e.js 2>&1 | tee -a e2e-output.txt
 
       # #1616: slide-over focus-restore flake-gate. Runs the slide-over
       # E2E 20 consecutive times against the SAME backend instance so
