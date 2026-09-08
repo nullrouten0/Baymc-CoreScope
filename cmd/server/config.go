@@ -547,8 +547,8 @@ func LoadTheme(baseDirs ...string) *ThemeFile {
 
 func (c *Config) GetHealthThresholds() HealthThresholds {
 	h := HealthThresholds{
-		InfraDegradedHours: 24,
-		InfraSilentHours:   72,
+		InfraDegradedHours: 72,
+		InfraSilentHours:   144,
 		NodeDegradedHours:  1,
 		NodeSilentHours:    24,
 		RelayActiveHours:   24,
