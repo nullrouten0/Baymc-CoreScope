@@ -429,8 +429,8 @@
 
   // ─── Health thresholds (ms) ───
   window.HEALTH_THRESHOLDS = {
-    infraDegradedMs: 86400000,   // 24h
-    infraSilentMs:   259200000,  // 72h
+    infraDegradedMs: 259200000,  // 72h
+    infraSilentMs:   518400000,  // 144h
     nodeDegradedMs:  3600000,    // 1h
     nodeSilentMs:    86400000    // 24h
   };
