@@ -295,6 +295,10 @@ func (s *Server) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/perf/io", s.handlePerfIO).Methods("GET")
 	r.HandleFunc("/api/perf/sqlite", s.handlePerfSqlite).Methods("GET")
 	r.HandleFunc("/api/perf/write-sources", s.handlePerfWriteSources).Methods("GET")
+	// Telegraf-friendly reshape of perfStats/getMemorySnapshot/reachState for
+	// a scrape-and-dashboard pipeline (see /api/perf for the human-facing
+	// equivalent, which returns Endpoints as a map rather than an array).
+	r.HandleFunc("/api/metrics", s.handleMetrics).Methods("GET")
 	r.HandleFunc("/api/mqtt/status", s.handleMqttStatus).Methods("GET")
 	r.Handle("/api/perf/reset", s.requireAdmin(http.HandlerFunc(s.handlePerfReset))).Methods("POST")
 	// /api/admin/prune removed in #1283 — pruning is owned by the
@@ -1091,6 +1095,108 @@ func (s *Server) handlePerf(w http.ResponseWriter, r *http.Request) {
 				NumCPU:       runtime.NumCPU(),
 			}
 		}(),
+	})
+}
+
+// MetricsRoute is one route's cumulative request stats as an array entry
+// (not a map, unlike /api/perf's Endpoints field) so a telegraf json_v2
+// scrape can tag each row by "route" without needing the key set up front.
+type MetricsRoute struct {
+	Route string  `json:"route"`
+	Count int     `json:"count"`
+	// TotalMs is the raw cumulative sum, alongside Count, specifically so a
+	// dashboard can derivative() both and divide — giving cost over the last
+	// scrape interval. AvgMs alone can't do that: it's a lifetime mean and
+	// stays stale for a long time after a fix lands (same trap documented in
+	// PathScope's make-pathscope-perf-dashboard.py, which this mirrors).
+	TotalMs float64 `json:"total_ms"`
+	AvgMs   float64 `json:"avg_ms"`
+	P50Ms   float64 `json:"p50_ms"`
+	P95Ms   float64 `json:"p95_ms"`
+	MaxMs   float64 `json:"max_ms"`
+}
+
+// MetricsResponse is the /api/metrics payload for a scrape-and-dashboard
+// pipeline. Everything here is already tracked elsewhere (perfStats,
+// getMemorySnapshot, reachState) except the Reach*/DegreeSnapshot* fields,
+// which node_reach.go added specifically because perfMiddleware only times
+// the whole /api/nodes/{pubkey}/reach handler, not the DB scan within it.
+type MetricsResponse struct {
+	UptimeSec     int            `json:"uptime_s"`
+	TotalRequests int64          `json:"total_requests"`
+	Routes        []MetricsRoute `json:"routes"`
+
+	Goroutines   int     `json:"goroutines"`
+	NumGC        uint32  `json:"num_gc"`
+	LastPauseMs  float64 `json:"last_pause_ms"`
+	ProcessRSSMB float64 `json:"process_rss_mb"`
+	HeapInuseMB  float64 `json:"heap_inuse_mb"`
+	HeapSysMB    float64 `json:"heap_sys_mb"`
+
+	ReachScanCalls        int64   `json:"reach_scan_calls"`
+	ReachScanTotalMs      float64 `json:"reach_scan_total_ms"`
+	ReachScanRowsScanned  int64   `json:"reach_scan_rows_scanned"`
+	DegreeSnapshotCalls   int64   `json:"degree_snapshot_calls"`
+	DegreeSnapshotTotalMs float64 `json:"degree_snapshot_total_ms"`
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	s.perfStats.mu.Lock()
+	type epSnap struct {
+		path    string
+		count   int
+		totalMs float64
+		maxMs   float64
+		recent  []float64
+	}
+	snaps := make([]epSnap, 0, len(s.perfStats.Endpoints))
+	for path, ep := range s.perfStats.Endpoints {
+		recentCopy := make([]float64, len(ep.Recent))
+		copy(recentCopy, ep.Recent)
+		snaps = append(snaps, epSnap{path, ep.Count, ep.TotalMs, ep.MaxMs, recentCopy})
+	}
+	uptimeSec := int(time.Since(s.perfStats.StartedAt).Seconds())
+	totalRequests := s.perfStats.Requests
+	s.perfStats.mu.Unlock()
+
+	routes := make([]MetricsRoute, 0, len(snaps))
+	for _, snap := range snaps {
+		sorted := sortedCopy(snap.recent)
+		routes = append(routes, MetricsRoute{
+			Route:   snap.path,
+			Count:   snap.count,
+			TotalMs: snap.totalMs,
+			AvgMs:   safeAvg(snap.totalMs, float64(snap.count)),
+			P50Ms:   round(percentile(sorted, 0.5), 1),
+			P95Ms:   round(percentile(sorted, 0.95), 1),
+			MaxMs:   round(snap.maxMs, 1),
+		})
+	}
+
+	var storeDataMB float64
+	if s.store != nil {
+		storeDataMB = s.store.trackedMemoryMB()
+	}
+	mem := s.getMemorySnapshot(storeDataMB)
+	ms := s.getMemStats()
+
+	writeJSON(w, MetricsResponse{
+		UptimeSec:     uptimeSec,
+		TotalRequests: totalRequests,
+		Routes:        routes,
+
+		Goroutines:   runtime.NumGoroutine(),
+		NumGC:        ms.NumGC,
+		LastPauseMs:  float64(ms.PauseNs[(ms.NumGC+255)%256]) / 1e6,
+		ProcessRSSMB: mem.ProcessRSSMB,
+		HeapInuseMB:  mem.GoHeapInuseMB,
+		HeapSysMB:    mem.GoSysMB,
+
+		ReachScanCalls:        s.reach.scanCalls.Load(),
+		ReachScanTotalMs:      float64(s.reach.scanTotalNs.Load()) / 1e6,
+		ReachScanRowsScanned:  s.reach.scanRowsScanned.Load(),
+		DegreeSnapshotCalls:   s.reach.degreeCalls.Load(),
+		DegreeSnapshotTotalMs: float64(s.reach.degreeTotalNs.Load()) / 1e6,
 	})
 }
 
