@@ -351,6 +351,18 @@ type reachState struct {
 
 	degreeMu   sync.Mutex
 	degreeSnap *degreeSnapshot
+
+	// Duration/count accumulators for the two expensive DB operations behind
+	// /api/nodes/{pubkey}/reach, surfaced via /api/metrics so a stall shows up
+	// on a dashboard instead of only in docker logs (grep "context canceled").
+	// scanRowsScanned counts only successfully-kept rows, not malformed/discarded
+	// ones, so it doubles as a throughput figure. degree counters only cover the
+	// rebuild branch of getDegreeSnapshot, not the (near-zero) cache-hit fast path.
+	scanCalls       atomic.Int64
+	scanTotalNs     atomic.Int64
+	scanRowsScanned atomic.Int64
+	degreeCalls     atomic.Int64
+	degreeTotalNs   atomic.Int64
 }
 
 // reachCacheGet returns the cached marshalled JSON for key. The returned slice
@@ -703,6 +715,12 @@ func (s *Server) getDegreeSnapshot(ctx context.Context) *degreeSnapshot {
 	stale := s.reach.degreeSnap
 	s.reach.degreeMu.Unlock()
 
+	rebuildStart := time.Now()
+	defer func() {
+		s.reach.degreeCalls.Add(1)
+		s.reach.degreeTotalNs.Add(int64(time.Since(rebuildStart)))
+	}()
+
 	// Rebuild WITHOUT holding the lock so concurrent reach requests aren't
 	// serialized behind the aggregate query. A brief cold-start herd may run a
 	// few redundant queries; the last writer wins.
@@ -769,6 +787,11 @@ func (s *Server) scanReachRows(ctx context.Context, tokens map[string]bool, sinc
 	if len(tokens) == 0 {
 		return nil, nil // defensive: an empty LIKE chain would render `AND ()` (SQL error)
 	}
+	scanStart := time.Now()
+	defer func() {
+		s.reach.scanCalls.Add(1)
+		s.reach.scanTotalNs.Add(int64(time.Since(scanStart)))
+	}()
 	args := []interface{}{sinceEpoch}
 	// Sort tokens so the generated SQL text is byte-stable across requests
 	// with the same token set — preserves the driver's prepared-statement
@@ -812,6 +835,7 @@ func (s *Server) scanReachRows(ctx context.Context, tokens map[string]bool, sinc
 		}
 		out = append(out, pr)
 	}
+	s.reach.scanRowsScanned.Add(int64(len(out)))
 	if skipped > 0 {
 		log.Printf("[reach] scan discarded %d malformed/empty rows (kept %d)", skipped, len(out))
 	}
