@@ -145,3 +145,19 @@ func TestTrimObservationHops_SlidesWindowAndDeletesByKey(t *testing.T) {
 		t.Fatalf("second trim deleted %d, want 0 (nothing newly out of window)", n)
 	}
 }
+
+// Scheduling the backfill inside OpenStore keeps live ingest dark for its whole
+// duration: main gates ingest on WaitForAsyncMigrations(). It must be started
+// explicitly, after the gate.
+func TestOpenStoreDoesNotScheduleHopBackfill(t *testing.T) {
+	s := newTestStore(t)
+	if st, err := s.AsyncMigrationStatus("observation_hops_backfill_v1"); err == nil {
+		t.Fatalf("OpenStore scheduled the hop backfill (status %q); it would block the ingest gate", st)
+	}
+	fastHopBackfill(t, 900)
+	s.ScheduleObservationHopsBackfill()
+	s.WaitForAsyncMigrations()
+	if st, err := s.AsyncMigrationStatus("observation_hops_backfill_v1"); err != nil || st != "done" {
+		t.Fatalf("explicit schedule: status %q err %v, want done", st, err)
+	}
+}

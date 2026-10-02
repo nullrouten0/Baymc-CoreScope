@@ -392,6 +392,8 @@ func main() {
 	keyBackfillCtx, stopKeyBackfill := context.WithCancel(context.Background())
 	defer stopKeyBackfill()
 	keyBackfillDone := keyBackfill.Start(keyBackfillCtx)
+	// After the gate: ingest is live, the backfill yields to it between chunks.
+	store.ScheduleObservationHopsBackfill()
 	if d := ingestBuffer.Dropped(); d > 0 {
 		log.Printf("[ingest-buffer] write path ready; draining backlog (dropped %d during startup — consider raising ingestBufferSize)", d)
 	} else {

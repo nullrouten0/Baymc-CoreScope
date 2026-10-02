@@ -234,18 +234,8 @@ func OpenStoreWithInterval(dbPath string, sampleIntervalSec int) (*Store, error)
 	var evidenceStatus string
 	_ = db.QueryRow(`SELECT status FROM _async_migrations WHERE name='advert_route_evidence_v1'`).Scan(&evidenceStatus)
 	s.advertEvidenceComplete.Store(evidenceStatus == "done")
-	// Inverted hop index for the reach scan. The table + triggers are created
-	// by dbschema.Apply (cheap, no row scan); this fills it for existing rows.
-	// PREFLIGHT: async=true reason="full observations scan in 1h chunks, throttled between chunks — must not block ingestor boot"
-	hopCtx, hopCancel := context.WithCancel(context.Background())
-	s.hopBackfillCancel = hopCancel
-	if err := s.RunAsyncMigration(hopCtx, "observation_hops_backfill_v1",
-		func(ctx context.Context, _ *sql.DB) error {
-			log.Println("[migration/async] Backfilling observation_hops from observations.path_json (newest first)...")
-			return s.backfillObservationHops(ctx)
-		}); err != nil {
-		log.Printf("[migration/async] scheduling observation_hops_backfill_v1 failed: %v", err)
-	}
+	// The observation_hops backfill is deliberately NOT scheduled here; see
+	// ScheduleObservationHopsBackfill (called from main once ingest is live).
 
 	return s, nil
 }

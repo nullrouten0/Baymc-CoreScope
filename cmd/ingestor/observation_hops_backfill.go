@@ -22,10 +22,10 @@ var hopIndexDays = defaultHopIndexDays
 // run it without sleeping.
 var (
 	// hopBackfillChunkSeconds is the timestamp span indexed per writer
-	// transaction. One hour is ~27k observations on a busy mesh — a few
-	// hundred ms of writer-lock hold, short enough that MQTT ingest queued
-	// behind it (writerMu, see WriterTx) is served at the next boundary.
-	hopBackfillChunkSeconds int64 = 3600
+	// transaction. 15 minutes is ~7k observations (~80k hop rows) on a busy
+	// mesh: on a small EBS-backed host an hour-sized chunk held the writer for
+	// 2-7s, which stalls live MQTT ingest behind it (writerMu, see WriterTx).
+	hopBackfillChunkSeconds int64 = 900
 	// hopBackfillPause is the idle gap between chunks. The backfill reads the
 	// whole observations table once; on a box whose page cache is far smaller
 	// than the DB that is real I/O contention, so it yields between chunks.
@@ -40,6 +40,24 @@ var (
 // Idempotent and resumable: it continues from the stored coverage mark, and the
 // inserts are OR IGNORE (the insert trigger may already have indexed a row that
 // arrived late with an old timestamp).
+// ScheduleObservationHopsBackfill starts the backfill as a tracked async
+// migration. It must be called AFTER the ingest buffer is opened: main gates
+// ingest on WaitForAsyncMigrations(), and a backfill that long (15 minutes on a
+// 13GB database) scheduled earlier keeps live ingest dark the whole time. Run
+// after the gate, it shares the writer with ingest one short chunk at a time.
+// Close() cancels it; it resumes from the stored coverage mark on next boot.
+func (s *Store) ScheduleObservationHopsBackfill() {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.hopBackfillCancel = cancel
+	if err := s.RunAsyncMigration(ctx, "observation_hops_backfill_v1",
+		func(ctx context.Context, _ *sql.DB) error {
+			log.Println("[migration/async] Backfilling observation_hops from observations.path_json (newest first)...")
+			return s.backfillObservationHops(ctx)
+		}); err != nil {
+		log.Printf("[migration/async] scheduling observation_hops_backfill_v1 failed: %v", err)
+	}
+}
+
 func (s *Store) backfillObservationHops(ctx context.Context) error {
 	var since int64
 	if err := s.db.QueryRow(`SELECT since FROM ` + dbschema.ObservationHopsCoverageTable + ` WHERE id = 1`).Scan(&since); err != nil {
