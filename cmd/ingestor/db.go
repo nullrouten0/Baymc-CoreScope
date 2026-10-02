@@ -87,6 +87,7 @@ type Store struct {
 	stmtBumpTxLastSeen         *sql.Stmt
 	stmtInsertObservation      *sql.Stmt
 	stmtInsertAdvertEvidence   *sql.Stmt
+	hopBackfillCancel          context.CancelFunc // stops the observation_hops backfill on Close
 	stmtUpsertNode             *sql.Stmt
 	stmtIncrementAdvertCount   *sql.Stmt
 	stmtUpsertObserver         *sql.Stmt
@@ -233,6 +234,19 @@ func OpenStoreWithInterval(dbPath string, sampleIntervalSec int) (*Store, error)
 	var evidenceStatus string
 	_ = db.QueryRow(`SELECT status FROM _async_migrations WHERE name='advert_route_evidence_v1'`).Scan(&evidenceStatus)
 	s.advertEvidenceComplete.Store(evidenceStatus == "done")
+	// Inverted hop index for the reach scan. The table + triggers are created
+	// by dbschema.Apply (cheap, no row scan); this fills it for existing rows.
+	// PREFLIGHT: async=true reason="full observations scan in 1h chunks, throttled between chunks — must not block ingestor boot"
+	hopCtx, hopCancel := context.WithCancel(context.Background())
+	s.hopBackfillCancel = hopCancel
+	if err := s.RunAsyncMigration(hopCtx, "observation_hops_backfill_v1",
+		func(ctx context.Context, _ *sql.DB) error {
+			log.Println("[migration/async] Backfilling observation_hops from observations.path_json (newest first)...")
+			return s.backfillObservationHops(ctx)
+		}); err != nil {
+		log.Printf("[migration/async] scheduling observation_hops_backfill_v1 failed: %v", err)
+	}
+
 	return s, nil
 }
 
@@ -1422,6 +1436,11 @@ func observerMetaColumns(meta *ObserverMeta) (model, firmware, clientVersion, ra
 
 // Close checkpoints the WAL and closes the database.
 func (s *Store) Close() error {
+	// Long resumable backfills must not hold shutdown hostage; they pick up
+	// from their stored progress on the next boot.
+	if s.hopBackfillCancel != nil {
+		s.hopBackfillCancel()
+	}
 	s.backfillWg.Wait()
 	s.Checkpoint()
 	return s.db.Close()

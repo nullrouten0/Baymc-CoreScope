@@ -254,6 +254,21 @@ type RetentionConfig struct {
 	// region-discovery stream would otherwise grow without limit. Consumed by
 	// Task 6's pruner.
 	ClientRegionsDays int `json:"clientRegionsDays"`
+	// HopIndexDays bounds the observation_hops inverted index (the accelerator
+	// behind /api/nodes/{pk}/reach) to this many days; 0 means the default (14).
+	// Real paths average ~11 hops, so the index costs ~330 bytes per
+	// observation: indexing the whole packetDays window can roughly double a
+	// large database. Reach windows longer than this fall back to the slower
+	// substring scan.
+	HopIndexDays int `json:"hopIndexDays"`
+}
+
+// HopIndexDaysOrDefault returns retention.hopIndexDays, or 14 when unset.
+func (c *Config) HopIndexDaysOrDefault() int {
+	if c.Retention != nil && c.Retention.HopIndexDays > 0 {
+		return c.Retention.HopIndexDays
+	}
+	return defaultHopIndexDays
 }
 
 // PacketDaysOrZero returns the configured retention.packetDays or 0

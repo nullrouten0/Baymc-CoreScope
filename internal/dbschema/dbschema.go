@@ -117,6 +117,9 @@ func Apply(rw *sql.DB, logf Logger) error {
 	// Advert evidence is intentionally not required by AssertReady: a legacy
 	// read-only server reports unknown until this table/backfill is available,
 	// and re-probes absence instead of caching the startup race permanently.
+	if err := EnsureObservationHopsSchema(rw, logf); err != nil {
+		return fmt.Errorf("ensure observation_hops: %w", err)
+	}
 	// tx_rewrite_feed (#2107) follows the same rule for the same reason: a
 	// server without it simply never sees in-place rewrites until restart,
 	// which is exactly the behaviour before the feed existed.
