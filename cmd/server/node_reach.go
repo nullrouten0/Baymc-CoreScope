@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"sort"
@@ -16,7 +16,6 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/meshcore-analyzer/dbschema"
-	"golang.org/x/sync/singleflight"
 )
 
 // reachScanRowLimit hard-caps the windowed observation scan so a hot relay node
@@ -333,15 +332,17 @@ type reachCacheEntry struct {
 type reachState struct {
 	cacheMu sync.RWMutex
 	cache   map[string]reachCacheEntry
-	// buildSem bounds how many cold-cache reach scans run at the same time.
-	// singleflight only collapses identical keys; distinct (pubkey, days)
-	// keys each start a scan, and the endpoint is unauthenticated, so
-	// without a cap a handful of requests can hold every SQLite reader.
-	buildSemOnce sync.Once
-	buildSem     chan struct{}
-	// sf dedups concurrent cold-cache requests for the same key so N
-	// simultaneous callers run the scan + attribution once, not N times.
-	sf singleflight.Group
+	// jobs holds the reach computations currently running, one per cache key.
+	// A computation runs on its OWN context (not the HTTP request's), so a slow
+	// scan survives the request that started it: callers wait up to
+	// reachWaitBudget, then get "202 building" and come back for the cached
+	// result. Concurrent callers for the same key share one job.
+	jobsMu sync.Mutex
+	jobs   map[string]*reachJob
+	// jobSem bounds how many detached scans run at once. grav has 2 vCPUs;
+	// extra jobs wait their turn (callers just see "building" for longer).
+	jobSemOnce sync.Once
+	jobSem     chan struct{}
 
 	// lastSeenBlacklistGen is the BlacklistGeneration() value that the cache
 	// was last reconciled with. When the live generation moves past this
@@ -504,47 +505,30 @@ func (s *Server) handleNodeReach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// singleflight: collapse a thundering herd on a cold key to one scan. The
-	// shared computation uses the triggering request's context; a disconnect
-	// there can cancel the in-flight scan for all waiters (acceptable — the
-	// next request recomputes).
-	v, err, _ := s.reach.sf.Do(cacheKey, func() (interface{}, error) {
-		if raw, ok := s.reachCacheGet(cacheKey); ok {
-			return raw, nil
-		}
-		release, ok := s.reachAcquireBuildSlot()
-		if !ok {
-			return nil, errReachBusy
-		}
-		defer release()
-		resp, ok, cErr := s.computeNodeReach(r.Context(), pubkey, days)
-		if cErr != nil {
-			// Real backend failure (e.g. DB scan exploded) — propagate so the
-			// caller renders 500 instead of the misleading empty-reach
-			// response. Do NOT cache. (#1631)
-			return nil, cErr
-		}
-		if !ok {
-			return []byte(nil), nil
-		}
-		raw, mErr := json.Marshal(resp)
-		if mErr != nil {
-			log.Printf("[reach] marshal failed for %s: %v", cacheKey, mErr)
-			return nil, mErr
-		}
-		s.reachCachePut(cacheKey, raw)
-		return raw, nil
-	})
-	if errors.Is(err, errReachBusy) {
-		w.Header().Set("Retry-After", strconv.Itoa(reachBusyRetryAfterSeconds))
-		writeError(w, http.StatusTooManyRequests, "too many reach computations in progress, retry shortly")
+	// Join (or start) the one computation for this key, then wait a bounded
+	// time for it. The computation is not tied to this request: if it is still
+	// running when the wait ends we answer "building" and let it finish, so the
+	// work is never thrown away when the HTTP server's 60 s write timeout (or the
+	// client) gives up. The finished result lands in the cache for the next call.
+	job := s.reachJobFor(cacheKey, pubkey, days)
+	timer := time.NewTimer(reachWaitBudget)
+	defer timer.Stop()
+	select {
+	case <-job.done:
+	case <-timer.C:
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", strconv.Itoa(reachRetryAfterSeconds))
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"status":"building","retry_after_seconds":%d,"detail":"reach is still being computed for this node (large nodes can take a minute). Retry after Retry-After seconds."}`, reachRetryAfterSeconds)
 		return
+	case <-r.Context().Done():
+		return // client left; the job keeps running and will be cached
 	}
-	if err != nil {
+	if job.err != nil {
 		writeError(w, 500, "reach computation failed")
 		return
 	}
-	raw, _ := v.([]byte)
+	raw := job.raw
 	if len(raw) == 0 {
 		writeError(w, 404, "Not found")
 		return
@@ -860,29 +844,6 @@ func (s *Server) readReachRows(ctx context.Context, q string, args []interface{}
 	return out, nil
 }
 
-// reachMaxConcurrentBuilds is the number of cold-cache reach scans allowed at
-// once. Two keeps half of the default 4-connection SQLite pool free for
-// every other handler while a scan runs.
-const reachMaxConcurrentBuilds = 2
-
-// reachBusyRetryAfterSeconds is the Retry-After we send with a 429.
-const reachBusyRetryAfterSeconds = 5
-
-// errReachBusy is returned inside the singleflight when no build slot is free.
-var errReachBusy = errors.New("reach: too many concurrent builds")
-
-// reachAcquireBuildSlot takes a build slot without blocking. It returns a
-// release func and true, or nil and false when all slots are busy.
-func (s *Server) reachAcquireBuildSlot() (func(), bool) {
-	s.reach.buildSemOnce.Do(func() { s.reach.buildSem = make(chan struct{}, reachMaxConcurrentBuilds) })
-	select {
-	case s.reach.buildSem <- struct{}{}:
-		return func() { <-s.reach.buildSem }, true
-	default:
-		return nil, false
-	}
-}
-
 // reachHopIndexCovers reports whether observation_hops can answer a window that
 // starts at sinceEpoch. The table is an optional accelerator maintained by the
 // ingestor (see internal/dbschema/observation_hops.go): a missing table or
@@ -918,4 +879,90 @@ func (s *Server) scanReachRowsIndexed(ctx context.Context, tokens map[string]boo
 	      WHERE o.id IN (SELECT observation_id FROM observation_hops WHERE hop IN (` + strings.Join(marks, ",") + `) AND timestamp >= ?)
 	      LIMIT ?`
 	return s.readReachRows(ctx, q, args)
+}
+
+// Tunables. vars so tests can shorten them.
+var (
+	// reachWaitBudget is how long a request waits for the computation before
+	// answering "202 building". Kept well under the server's 60 s WriteTimeout.
+	reachWaitBudget = 45 * time.Second
+	// reachRetryAfterSeconds is what the client is told to wait before asking again.
+	reachRetryAfterSeconds = 5
+	// reachJobTimeout bounds a detached computation so a wedged query cannot run forever.
+	reachJobTimeout = 5 * time.Minute
+	// reachMaxConcurrentJobs bounds simultaneous detached scans.
+	reachMaxConcurrentJobs = 2
+	// reachJobStartHook, when non-nil, runs at the start of every detached
+	// computation (after it won a concurrency slot). Tests use it to hold a job
+	// open; nil in production.
+	reachJobStartHook func()
+)
+
+// reachJob is one in-flight reach computation. raw/err are written once,
+// before done is closed.
+type reachJob struct {
+	done chan struct{}
+	raw  []byte // nil with err==nil means "node not found" (404)
+	err  error
+}
+
+// reachJobFor returns the running job for key, starting one if none exists.
+func (s *Server) reachJobFor(key, pubkey string, days int) *reachJob {
+	s.reach.jobsMu.Lock()
+	if j, ok := s.reach.jobs[key]; ok {
+		s.reach.jobsMu.Unlock()
+		return j
+	}
+	if s.reach.jobs == nil {
+		s.reach.jobs = make(map[string]*reachJob)
+	}
+	j := &reachJob{done: make(chan struct{})}
+	s.reach.jobs[key] = j
+	s.reach.jobsMu.Unlock()
+	go s.runReachJob(j, key, pubkey, days)
+	return j
+}
+
+func (s *Server) runReachJob(j *reachJob, key, pubkey string, days int) {
+	defer func() {
+		if r := recover(); r != nil {
+			j.err = fmt.Errorf("reach job panic: %v", r)
+			log.Printf("[reach] job panic for %s: %v", key, r)
+		}
+		s.reach.jobsMu.Lock()
+		delete(s.reach.jobs, key)
+		s.reach.jobsMu.Unlock()
+		close(j.done)
+	}()
+	s.reach.jobSemOnce.Do(func() { s.reach.jobSem = make(chan struct{}, reachMaxConcurrentJobs) })
+	s.reach.jobSem <- struct{}{}
+	defer func() { <-s.reach.jobSem }()
+
+	if h := reachJobStartHook; h != nil {
+		h()
+	}
+	// A queued job may find the answer already cached by an earlier one.
+	if raw, ok := s.reachCacheGet(key); ok {
+		j.raw = raw
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), reachJobTimeout)
+	defer cancel()
+	resp, ok, err := s.computeNodeReach(ctx, pubkey, days)
+	if err != nil {
+		// Real backend failure — never cached, so the next request retries (#1631).
+		j.err = err
+		return
+	}
+	if !ok {
+		return // not found
+	}
+	raw, mErr := json.Marshal(resp)
+	if mErr != nil {
+		log.Printf("[reach] marshal failed for %s: %v", key, mErr)
+		j.err = mErr
+		return
+	}
+	s.reachCachePut(key, raw)
+	j.raw = raw
 }

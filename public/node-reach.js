@@ -135,6 +135,47 @@
     }
   }
 
+  // Plain-words progress note while the server finishes a big node. First paint
+  // replaces the loader text; a time-range change keeps the current report and
+  // adds a one-line note above it.
+  function showBuilding(container, isInitial, secs) {
+    var msg = 'Still working on this node — large, busy nodes can take a minute or two' +
+      (secs > 0 ? ' (' + secs + 's so far)' : '') + '…';
+    if (isInitial) {
+      container.innerHTML = '<div class="nq-load">' + escapeHtml(msg) + '</div>';
+      return;
+    }
+    var note = container.querySelector('#nq-building');
+    if (!note) {
+      note = document.createElement('div');
+      note.id = 'nq-building';
+      note.className = 'nq-msg';
+      container.insertBefore(note, container.firstChild);
+    }
+    note.textContent = msg;
+  }
+
+  // BEGIN fetchReach (extracted and unit-tested by tests/unit/test-node-reach-building.js)
+  // The server answers 202 {"status":"building"} when a big node's reach is still
+  // being worked out (it keeps working after the request ends and caches the
+  // result). Ask again until the real report arrives. onWait(elapsedSeconds) lets
+  // the page say "still working"; isCurrent() lets a newer load stop this one.
+  var REACH_MAX_WAIT_MS = 5 * 60 * 1000;
+  async function fetchReach(apiFn, path, opts) {
+    var started = Date.now();
+    for (;;) {
+      var d = await apiFn(path, { ttl: 30000 });
+      if (!(d && d.status === 'building' && !d.node)) return d;
+      if (!opts.isCurrent()) return null;
+      var waited = Date.now() - started;
+      if (waited > REACH_MAX_WAIT_MS) throw new Error('reach is taking too long to compute — try a shorter time range');
+      opts.onWait(Math.round(waited / 1000));
+      await opts.sleep(Math.max(1, d.retry_after_seconds || 5) * 1000);
+      if (!opts.isCurrent()) return null;
+    }
+  }
+  // END fetchReach
+
   // isInitial=true shows the centred loader (first paint); time-range changes
   // pass false so the current report stays on screen until the swap (no flash).
   async function load(container, pubkey, days, isInitial) {
@@ -154,7 +195,12 @@
 
     var d;
     try {
-      d = await api('/nodes/' + encodeURIComponent(pubkey) + '/reach?days=' + days, { ttl: 30000 });
+      d = await fetchReach(api, '/nodes/' + encodeURIComponent(pubkey) + '/reach?days=' + days, {
+        isCurrent: function () { return myGen === loadGen; },
+        sleep: function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); },
+        onWait: function (secs) { showBuilding(container, isInitial, secs); }
+      });
+      if (d === null) return; // superseded by a newer load
     } catch (e) {
       if (myGen !== loadGen) return; // superseded or destroyed mid-flight
       container.innerHTML = '<div id="nq-report"><div class="nq-error">Failed to load reach: ' + escapeHtml(e.message) + '</div></div>';

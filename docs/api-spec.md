@@ -836,6 +836,17 @@ to a recent window. Identifies nodes only by **unique 2–3 byte** path prefixes
 |--------|--------|---------|--------------------------------------|
 | `days` | number | `7`     | Lookback window, clamped 1–30        |
 
+### Response `202` (still working)
+
+Large, busy nodes can take longer than the server's response timeout. The server
+keeps working after the request ends and caches the result, and in the meantime
+answers `202` with a `Retry-After` header and this body. Ask again after that many
+seconds; the finished report is returned as a normal `200`.
+
+```json
+{ "status": "building", "retry_after_seconds": 5, "detail": "reach is still being computed for this node ..." }
+```
+
 ### Response `200`
 
 ```jsonc
