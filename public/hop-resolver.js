@@ -546,7 +546,8 @@ window.HopResolver = (function() {
    *   aligned with hops; a non-null entry restricts that hop to that node
    * @returns {Array} one entry per hop: { hop, name, pubkey, lat, lon,
    *   located, unlisted, unreliable, ambiguous, confidence, candidates,
-   *   conflicts } — candidates sorted by confidence, located first
+   *   conflicts } — candidates sorted by confidence, located first; one the
+   *   path uses at another hop carries usedAt (that hop's index)
    */
   function inferPath(hops, opts) {
     if (!hops || !hops.length) return [];
@@ -594,6 +595,19 @@ window.HopResolver = (function() {
       sol = firstWins ? s1 : s2;
     }
 
+    // For confidence, a node the path uses at one hop is no alternative at
+    // another. The best path stays feasible, so the assignment is unchanged.
+    const usedAt = new Map();
+    sol.assign.forEach((k, i) => { if (k >= 0) usedAt.set(C[i][k].pubkey, i); });
+    const confidenceBans = C.map((c, i) => {
+      const s = new Set(bans[i] || []);
+      for (const pt of c) {
+        const j = usedAt.get(pt.pubkey);
+        if (j !== undefined && j !== i) s.add(pt.pubkey);
+      }
+      return s.size ? s : null;
+    });
+    sol = solvePath(C, steps, start, end, confidenceBans);
     const mu = unlistedMarginals(C, steps, start, end, sol.F, sol.B);
     const T = PATH_MODEL.temperature;
     return hops.map((hop, i) => {
@@ -603,10 +617,13 @@ window.HopResolver = (function() {
       const wUnlisted = mu[i] === Infinity ? 0 : Math.exp(-(mu[i] - lowest) / T);
       const sum = weights.reduce((s, w) => s + w, wUnlisted) || 1;
 
-      const candidates = C[i].map((pt, k) => ({
-        name: pt.node.name, pubkey: pt.pubkey, lat: pt.node.lat, lon: pt.node.lon,
-        located: true, confidence: weights[k] / sum,
-      })).sort((a, b) => b.confidence - a.confidence);
+      const candidates = C[i].map((pt, k) => {
+        const c = { name: pt.node.name, pubkey: pt.pubkey, lat: pt.node.lat, lon: pt.node.lon,
+          located: true, confidence: weights[k] / sum };
+        const j = usedAt.get(pt.pubkey);
+        if (j !== undefined && j !== i) c.usedAt = j; // the path has it at hop j
+        return c;
+      }).sort((a, b) => b.confidence - a.confidence);
       for (const n of unplaced[i]) {
         candidates.push({ name: n.name, pubkey: n.public_key, lat: null, lon: null, located: false, confidence: null });
       }

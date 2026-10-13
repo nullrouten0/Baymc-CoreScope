@@ -48,6 +48,10 @@ console.log('Test 1: the same prefix at two positions resolves independently');
   assert(pk(out[0]) === a1.public_key, 'hop 0 is the AA node near the start — got ' + (out[0] && out[0].name));
   assert(pk(out[3]) === a2.public_key, 'hop 3 is the AA node near the observer — got ' + (out[3] && out[3].name));
   assert(out[0].hop === 'AA' && out[3].hop === 'AA', 'each entry carries its hop prefix');
+  const other = out[0].candidates.find(c => c.pubkey === a2.public_key);
+  assert(other && other.usedAt === 3 && other.confidence === 0,
+    'a node the path uses at another hop is no alternative, and says where it is used');
+  assert(out[0].confidence > 0.7, 'so hop 0 is confident — ' + out[0].confidence.toFixed(2));
 }
 
 console.log('\nTest 2: the last hop is anchored to the observer');
